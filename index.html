@@ -748,13 +748,16 @@ async function fetchInfo() {
       data = {};
     }
 
-    if (!res.ok) return showError(data.error || data.detail || 'Failed to fetch video info.');
-    if (!data || !data.url) return showError('No download URL was returned by the server.');
+    const apiError = getApiError(data);
+    const downloadUrl = normalizeDownloadUrl(getApiDownloadUrl(data));
+
+    if (!res.ok) return showError(apiError || 'Failed to fetch video info.');
+    if (!downloadUrl) return showError(apiError || 'No download URL was returned by the server.');
 
     // MODIFIED: FastAPI returns { title, url }; keep state in the requested shape.
     currentVideoInfo = {
-      title: data.title,
-      downloadUrl: data.url,
+      title: getApiTitle(data),
+      downloadUrl,
       originalUrl: url,
     };
 
@@ -935,6 +938,29 @@ function hideInfoCard() {
 // ── Utils ──────────────────────────────────────────────────────────────────
 function isYouTubeUrl(url) {
   return /^(https?:\/\/)?(www\.)?(youtube\.com\/(watch\?v=|shorts\/)|youtu\.be\/)/.test(url);
+}
+// MODIFIED: Normalize FastAPI response fields while keeping data.url as the primary contract.
+function getApiTitle(data) {
+  return data?.title || data?.data?.title || data?.result?.title || 'Untitled video';
+}
+function getApiDownloadUrl(data) {
+  return data?.url || data?.downloadUrl || data?.download_url || data?.data?.url || data?.result?.url || '';
+}
+function normalizeDownloadUrl(url) {
+  if (!url || typeof url !== 'string') return '';
+  try {
+    const parsed = new URL(url.trim(), API);
+    return ['http:', 'https:'].includes(parsed.protocol) ? parsed.href : '';
+  } catch {
+    return '';
+  }
+}
+function getApiError(data) {
+  const error = data?.error || data?.detail;
+  if (!error) return '';
+  if (typeof error === 'string') return error;
+  if (Array.isArray(error)) return error.map(item => item?.msg || String(item)).join(' ');
+  return error.message || JSON.stringify(error);
 }
 // MODIFIED: Local helpers replace metadata formerly supplied by the old info lookup.
 function getYouTubeId(url) {
