@@ -630,6 +630,8 @@
 // ── State ──────────────────────────────────────────────────────────────────
 // MODIFIED: FastAPI backend base URL.
 const API = 'https://akashh89-ytgrab-new.hf.space';
+// MODIFIED: Local static-server URL to avoid file:// browser security restrictions.
+const LOCAL_APP_URL = 'http://127.0.0.1:8000/index.html';
 let currentVideoInfo = null;
 let selectedFormat = 'video';
 let selectedQuality = '720p';
@@ -658,6 +660,8 @@ const progressPct  = document.getElementById('progressPct');
 const downloadBtnText = document.getElementById('downloadBtnText');
 const historyList  = document.getElementById('historyList');
 const qualityRow   = document.getElementById('qualityRow');
+// MODIFIED: Preserve initial quality-row markup so input reset can restore the original UI shell.
+const defaultQualityButtonsHtml = qualityRow.innerHTML;
 
 // ── Theme Toggle ───────────────────────────────────────────────────────────
 const themeBtn = document.getElementById('themeBtn');
@@ -681,19 +685,14 @@ document.querySelectorAll('.format-chip').forEach(chip => {
     document.querySelectorAll('.format-chip').forEach(c => c.classList.remove('active'));
     chip.classList.add('active');
     selectedFormat = chip.dataset.format;
-    qualityRow.className = `quality-row ${selectedFormat === 'video' ? 'visible' : 'hidden'}`;
-    updateDownloadButton();
+    // MODIFIED: Format chips keep their UI state; fetched formats are rendered as buttons below.
+    qualityRow.className = 'quality-row visible';
+    if (currentVideoInfo) renderFormatButtons();
   });
 });
 
 // ── Quality Buttons ────────────────────────────────────────────────────────
-document.querySelectorAll('.quality-btn').forEach(btn => {
-  btn.addEventListener('click', () => {
-    document.querySelectorAll('.quality-btn').forEach(b => b.classList.remove('active'));
-    btn.classList.add('active');
-    selectedQuality = btn.dataset.q;
-  });
-});
+bindPlaceholderQualityButtons();
 
 // ── Paste Button ───────────────────────────────────────────────────────────
 pasteBtn.addEventListener('click', async () => {
@@ -701,14 +700,18 @@ pasteBtn.addEventListener('click', async () => {
     const text = await navigator.clipboard.readText();
     if (text && text.includes('youtube') || text.includes('youtu.be')) {
       urlInput.value = text.trim();
-      showMessage(null);
+      resetFetchedState();
     } else if (text) {
       urlInput.value = text.trim();
+      resetFetchedState();
     }
   } catch {
     urlInput.focus();
   }
 });
+
+// MODIFIED: Reset fetched info and format buttons when the user changes the URL.
+urlInput.addEventListener('input', resetFetchedState);
 
 // ── Auto-detect paste in input ─────────────────────────────────────────────
 urlInput.addEventListener('paste', () => {
@@ -729,6 +732,8 @@ urlInput.addEventListener('keydown', (e) => {
 fetchBtn.addEventListener('click', fetchInfo);
 
 async function fetchInfo() {
+  if (!ensureHttpOrigin()) return;
+
   const url = urlInput.value.trim();
   if (!url) return showError('Please paste a YouTube URL.');
   if (!isYouTubeUrl(url)) return showError('That doesn\'t look like a valid YouTube URL.');
@@ -736,11 +741,14 @@ async function fetchInfo() {
   showMessage(null);
   setFetchLoading(true);
   hideInfoCard();
+  hideProgress();
   downloadBtn.classList.remove('visible');
+  currentVideoInfo = null;
+  renderPlaceholderQualityButtons();
 
   try {
-    // MODIFIED: GET /download?url= replaces the old info lookup flow.
-    const res = await fetch(`${API}/download?url=${encodeURIComponent(url)}`);
+    // MODIFIED: Fetch metadata only. Downloads are started later from a format button.
+    const res = await fetch(`${API}/info?url=${encodeURIComponent(url)}`);
     let data = {};
     try {
       data = await res.json();
@@ -749,89 +757,135 @@ async function fetchInfo() {
     }
 
     const apiError = getApiError(data);
-    const downloadUrl = normalizeDownloadUrl(getApiDownloadUrl(data));
 
-    if (!res.ok) return showError(apiError || 'Failed to fetch video info.');
-    if (!downloadUrl) return showError(apiError || 'No download URL was returned by the server.');
+    // MODIFIED: Backend returns {"error": "..."} with HTTP 200 on exceptions.
+    if (!res.ok || apiError) return showError(apiError || 'Failed to fetch video info.');
 
-    // MODIFIED: FastAPI returns { title, url }; keep state in the requested shape.
+    // MODIFIED: Store /info response in global state for rendering and downloads.
     currentVideoInfo = {
-      title: getApiTitle(data),
-      downloadUrl,
+      title: data.title || 'Untitled video',
+      thumbnail: data.thumbnail || getYouTubeThumbnail(url),
+      video_formats: Array.isArray(data.video_formats) ? data.video_formats : [],
+      audio_formats: Array.isArray(data.audio_formats) ? data.audio_formats : [],
       originalUrl: url,
     };
 
+    if (!currentVideoInfo.video_formats.length && !currentVideoInfo.audio_formats.length) {
+      currentVideoInfo = null;
+      return showError('No downloadable formats were returned by the server.');
+    }
+
     displayInfo(currentVideoInfo);
-    downloadBtn.classList.add('visible');
-    updateDownloadButton();
+    renderFormatButtons();
   } catch (err) {
-    showError('Cannot connect to the download server. Please try again.');
+    showError('Cannot connect to the video info server. Please try again.');
   } finally {
     setFetchLoading(false);
   }
 }
 
 function displayInfo(data) {
-  // MODIFIED: Derive thumbnail locally because the API only returns title and download URL.
-  thumbImg.src = getYouTubeThumbnail(data.originalUrl);
-  durationBadge.textContent = data.durationString || (data.duration ? formatSeconds(data.duration) : '—');
+  // MODIFIED: Render title and thumbnail from /info response.
+  thumbImg.src = data.thumbnail || getYouTubeThumbnail(data.originalUrl);
+  durationBadge.textContent = '—';
   videoTitle.textContent = data.title || 'Untitled video';
-  uploaderTag.textContent = data.uploader || 'Unknown';
-  viewsTag.textContent = data.viewCount ? formatViews(data.viewCount) + ' views' : '—';
-  dateTag.textContent = data.uploadDate ? formatDate(data.uploadDate) : '—';
+  uploaderTag.textContent = 'Formats ready';
+  viewsTag.textContent = `${data.video_formats.length} video`;
+  dateTag.textContent = `${data.audio_formats.length} audio`;
   infoCard.classList.add('visible');
 
-  // Update available qualities
-  if (data.availableQualities) {
-    document.querySelectorAll('.quality-btn').forEach(btn => {
-      if (data.availableQualities.includes(btn.dataset.q)) {
-        btn.style.opacity = '1';
-        btn.disabled = false;
-      } else {
-        btn.style.opacity = '0.35';
-      }
-    });
+}
+
+// MODIFIED: Render the /info video/audio formats as clickable download buttons.
+function renderFormatButtons() {
+  if (!currentVideoInfo) {
+    renderPlaceholderQualityButtons();
+    return;
   }
+
+  qualityRow.innerHTML = '';
+  qualityRow.className = 'quality-row visible';
+  qualityRow.style.maxHeight = 'none';
+  downloadBtn.classList.remove('visible');
+
+  renderFormatSection('Video formats', currentVideoInfo.video_formats, 'video');
+  renderFormatSection('Audio formats', currentVideoInfo.audio_formats, 'audio');
+}
+
+function renderFormatSection(label, formats, type) {
+  if (!formats.length) return;
+
+  const heading = document.createElement('span');
+  heading.className = 'info-tag';
+  heading.textContent = label;
+  heading.style.flexBasis = '100%';
+  qualityRow.appendChild(heading);
+
+  formats.forEach(format => {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'quality-btn';
+    btn.dataset.formatId = format.format_id;
+    btn.textContent = getFormatButtonText(format, type);
+    btn.addEventListener('click', () => startDownload(format));
+    qualityRow.appendChild(btn);
+  });
+}
+
+function renderPlaceholderQualityButtons() {
+  qualityRow.innerHTML = defaultQualityButtonsHtml;
+  qualityRow.style.maxHeight = '';
+  qualityRow.className = 'quality-row visible';
+  bindPlaceholderQualityButtons();
+}
+
+function bindPlaceholderQualityButtons() {
+  qualityRow.querySelectorAll('.quality-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      qualityRow.querySelectorAll('.quality-btn').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      selectedQuality = btn.dataset.q;
+    });
+  });
+}
+
+function getFormatButtonText(format, type) {
+  if (type === 'audio' && typeof format.quality === 'number') return `${format.quality} kbps`;
+  return format.quality ? String(format.quality) : (format.ext || 'Download');
 }
 
 function updateDownloadButton() {
-  if (!currentVideoInfo) return;
-  const icon = selectedFormat === 'video' ? '📹' : '🎵';
-  const label = selectedFormat === 'video' ? `Download ${selectedQuality} MP4` : 'Download MP3 Audio';
-  downloadBtnText.textContent = `${icon} ${label}`;
+  downloadBtnText.textContent = 'Choose a format';
 }
 
 // ── Download ───────────────────────────────────────────────────────────────
-downloadBtn.addEventListener('click', startDownload);
+downloadBtn.addEventListener('click', () => showError('Choose a video or audio format button to start download.'));
 
-function startDownload() {
-  if (!currentVideoInfo) return;
-  if (!currentVideoInfo.downloadUrl) return showError('No download URL is available. Please fetch the video again.');
+function startDownload(format) {
+  if (!ensureHttpOrigin()) return;
+  if (!currentVideoInfo) return showError('Fetch video info first.');
+  if (!format || !format.format_id) return showError('This format is missing a download id.');
 
   showMessage(null);
-  setDownloadLoading(true);
   showProgress('Opening download…');
 
   try {
-    // MODIFIED: Direct browser download; the FastAPI backend no longer streams files.
-    const a = document.createElement('a');
-    a.href = currentVideoInfo.downloadUrl;
-    a.target = '_blank';
-    a.rel = 'noopener';
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
+    // MODIFIED: Download only starts after a format button is clicked.
+    const downloadUrl = `${API}/download?url=${encodeURIComponent(currentVideoInfo.originalUrl)}&format_id=${encodeURIComponent(format.format_id)}`;
+    const opened = window.open(downloadUrl, '_blank', 'noopener');
+    if (!opened) {
+      hideProgress();
+      return showError('Popup blocked. Allow popups for this page and try again.');
+    }
 
     setProgress(100, 'Download opened!');
-    showSuccess('Download opened in a new tab.');
+    showSuccess('Download started.');
     addToHistory(currentVideoInfo);
 
     setTimeout(hideProgress, 1500);
   } catch (err) {
     hideProgress();
     showError('Download failed. Check your connection and try again.');
-  } finally {
-    setDownloadLoading(false);
   }
 }
 
@@ -844,7 +898,7 @@ function addToHistory(info) {
     id,
     url: originalUrl,
     title: info.title,
-    thumbnail: getYouTubeThumbnail(originalUrl),
+    thumbnail: info.thumbnail || getYouTubeThumbnail(originalUrl),
     time: Date.now(),
   };
   history = [entry, ...history.filter(h => h.id !== entry.id)].slice(0, 10);
@@ -881,6 +935,16 @@ document.getElementById('clearHistoryBtn').addEventListener('click', () => {
 });
 
 // ── UI Helpers ─────────────────────────────────────────────────────────────
+// MODIFIED: Clear fetched metadata and dynamic format buttons when the URL changes.
+function resetFetchedState() {
+  currentVideoInfo = null;
+  hideInfoCard();
+  hideProgress();
+  showMessage(null);
+  downloadBtn.classList.remove('visible');
+  renderPlaceholderQualityButtons();
+}
+
 function setFetchLoading(on) {
   fetchBtn.disabled = on;
   fetchBtn.innerHTML = on
@@ -936,25 +1000,17 @@ function hideInfoCard() {
 }
 
 // ── Utils ──────────────────────────────────────────────────────────────────
+// MODIFIED: Prevent file:// execution, which Chrome treats as an isolated origin.
+function ensureHttpOrigin() {
+  if (window.location.protocol !== 'file:') return true;
+  showError(`Open this app from ${LOCAL_APP_URL} instead of the file path.`);
+  return false;
+}
+
 function isYouTubeUrl(url) {
   return /^(https?:\/\/)?(www\.)?(youtube\.com\/(watch\?v=|shorts\/)|youtu\.be\/)/.test(url);
 }
-// MODIFIED: Normalize FastAPI response fields while keeping data.url as the primary contract.
-function getApiTitle(data) {
-  return data?.title || data?.data?.title || data?.result?.title || 'Untitled video';
-}
-function getApiDownloadUrl(data) {
-  return data?.url || data?.downloadUrl || data?.download_url || data?.data?.url || data?.result?.url || '';
-}
-function normalizeDownloadUrl(url) {
-  if (!url || typeof url !== 'string') return '';
-  try {
-    const parsed = new URL(url.trim(), API);
-    return ['http:', 'https:'].includes(parsed.protocol) ? parsed.href : '';
-  } catch {
-    return '';
-  }
-}
+// MODIFIED: Extract readable API errors from FastAPI responses.
 function getApiError(data) {
   const error = data?.error || data?.detail;
   if (!error) return '';
@@ -1015,6 +1071,7 @@ function escHtml(str) {
 
 // ── Init ───────────────────────────────────────────────────────────────────
 renderHistory();
+ensureHttpOrigin();
 </script>
 </body>
 </html>
